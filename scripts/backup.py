@@ -7,20 +7,14 @@ import pathlib
 import shutil
 import time
 
-class TigrisfsMount:
-  def __init__(self, name, path, access_key_id, secret_access_key, endpoint_url):
-    for arg in ['path', 'access_key_id', 'secret_access_key', 'endpoint_url']:
-      if not locals()[arg]:
-        raise ValueError(f"{arg} is required for TigrisFS mount '{name}'.")
-
+class RcloneMount:
+  def __init__(self, name, path):
     self.name = name
     self.path = path
     self.mountpoint = f'/data/{name}'
-    self.mount_source = path
-    self.access_key_id = access_key_id
-    self.secret_access_key = secret_access_key
-    self.endpoint_url = endpoint_url
-    self.was_mounted = False
+    self.mount_source = f'{name}:{path}'
+    self.socket = f'/run/backup/{name}.sock'
+    self.rclone_process = None
 
   def is_mounted(self):
     with open('/proc/mounts', 'r') as mounts_file:
@@ -29,40 +23,59 @@ class TigrisfsMount:
 
   def __enter__(self):
     if self.is_mounted():
-      self.was_mounted = True
-      return self
-    self.mount()
-    return self
-
-  def __exit__(self, exc_type, exc_val, exc_tb):
-    if not self.was_mounted:
-      self.unmount()
-    return False
-
-  def mount(self):
-    if self.is_mounted():
-      return
+      raise RuntimeError(f"{self.name} is already mounted at {self.mountpoint}.")
+    try:
+      os.remove(self.socket)
+    except FileNotFoundError:
+      pass
     pathlib.Path(self.mountpoint).mkdir(parents=True, exist_ok=True)
-    tigrisfs_env = os.environ | {
-      'AWS_ENDPOINT_URL': self.endpoint_url,
-      'AWS_ACCESS_KEY_ID': self.access_key_id,
-      'AWS_SECRET_ACCESS_KEY': self.secret_access_key,
-    }
-    subprocess.run(
-      ['/usr/local/bin/tigrisfs', self.mount_source, self.mountpoint, ],
+    self.rclone_process = subprocess.Popen(
+      ['rclone', 'mount', self.mount_source, self.mountpoint,
+       '--rc',
+       '--rc-addr', self.socket,
+       '--vfs-cache-mode=full'],
       stdout=subprocess.DEVNULL,
       stderr=subprocess.DEVNULL,
-      env=tigrisfs_env,
-      check=True,
     )
     while True:
+      if self.rclone_process.poll() is not None:
+        raise RuntimeError(f"Rclone mount process for {self.name} failed to start.")
       if self.is_mounted():
         break
       print(f"Waiting for {self.name} to mount...")
       time.sleep(1)
+    return self
+
+  def __exit__(self, exc_type, exc_val, exc_tb):
+    self.unmount()
+    return False
+
+  def rc(self, command, **kwargs):
+    cmd = ['rclone', 'rc', '--unix-socket', self.socket, command]
+    for key, value in kwargs.items():
+      cmd.append(f'{key}={value}')
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return json.loads(result.stdout)
 
   def unmount(self):
-    subprocess.run(['/usr/bin/fusermount3', '-u', self.mountpoint], check=True)
+    while True:
+      vfs_stats = self.rc('vfs/stats', fs=self.mount_source)
+      disk_cache = vfs_stats.get('diskCache', None)
+      if disk_cache is None:
+        # read-only or uncached mount
+        break
+      if 0 == disk_cache.get('uploadsInProgress', 0) \
+          and 0 == disk_cache.get('uploadsQueued', 0):
+        break
+      print(f"Waiting for cache to flush on {self.name}...")
+      time.sleep(1)
+
+    if self.rclone_process:
+      self.rc('core/quit')
+      exit_code = self.rclone_process.wait(timeout=10)
+      if exit_code != 0:
+        raise RuntimeError(f"rclone mount for {self.name} exit with code {exit_code}.")
+      self.rclone_process = None
 
 def is_borg_repo(target_path):
   try:
@@ -85,8 +98,8 @@ def run_backup(backup_label, target_name, target_config, target_secrets):
     raise ValueError(f"No borg_passphrase provided for target {target_name}.")
 
   print(f"Starting backup to {target_name}...")
-  with target_mount(target_name, target_config, target_secrets) as mounted_target:
-    borg_repo = mounted_target.mountpoint
+  with RcloneMount(f'target-{target_name}', target_config.get('path', '/')) as target_mount:
+    borg_repo = target_mount.mountpoint
     if not is_borg_repo(borg_repo):
       init_borg_repo(borg_repo, borg_passphrase)
 
@@ -103,22 +116,6 @@ def run_backup(backup_label, target_name, target_config, target_secrets):
 
   print(f"Backup to {target_name} completed successfully.")
 
-def source_mount():
-  return TigrisfsMount(
-      'source',
-      os.getenv('SOURCE_PATH'),
-      access_key_id=os.getenv('SOURCE_ACCESS_KEY_ID'),
-      secret_access_key=os.getenv('SOURCE_SECRET_ACCESS_KEY'),
-      endpoint_url=os.getenv('SOURCE_ENDPOINT'))
-
-def target_mount(target_name, target_config, target_secrets):
-  return TigrisfsMount(
-      f'target-{target_name}',
-      target_config.get('path'),
-      access_key_id=target_secrets.get('access_key_id'),
-      secret_access_key=target_secrets.get('secret_access_key'),
-      endpoint_url=target_config.get('endpoint'))
-
 def run_backups():
   pathlib.Path('/run/backup').mkdir(parents=True, exist_ok=True)
 
@@ -126,32 +123,12 @@ def run_backups():
   targets = json.loads(os.getenv('TARGETS', '{}'))
   target_secrets = json.loads(os.getenv('TARGET_SECRETS', '{}'))
 
-  with source_mount():
+  with RcloneMount('source', os.getenv('SOURCE_PATH', '/')):
     for target_name, target_config in targets.items():
       secrets = target_secrets.get(target_name, {})
       run_backup(backup_label, target_name, target_config, secrets)
 
-def mount(name):
-  if name == 'source':
-    source_mount().mount()
-    return
-  if not name.startswith('target-'):
-    raise ValueError(f"Invalid mount name: {name}. Must be 'source' or 'target-<target_name>'.")
-  name = name[len('target-'):]
-  if name not in json.loads(os.getenv('TARGETS', '{}')):
-    raise ValueError(f"Target '{name}' not found in TARGETS environment variable.")
-  target_config = json.loads(os.getenv('TARGETS', '{}')).get(name, {})
-  target_secrets = json.loads(os.getenv('TARGET_SECRETS', '{}')).get(name, {})
-  target_mount(name, target_config, target_secrets).mount()
-
 if __name__ == "__main__":
-  if len(os.sys.argv) > 1 and os.sys.argv[1] == 'mount':
-    if len(os.sys.argv) < 3:
-      print("Usage: backup.py mount [source|target-<target_name>]")
-      exit(1)
-    mount(os.sys.argv[2])
-    exit(0)
-
   try:
     run_backups()
   except Exception as e:
