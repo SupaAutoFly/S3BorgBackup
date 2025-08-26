@@ -1,5 +1,6 @@
-FROM python:3-alpine
+FROM alpine:3
 RUN apk add --no-cache \
+  python3 \
   borgbackup \
   ca-certificates \
   fuse3 \
