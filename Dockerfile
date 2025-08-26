@@ -3,6 +3,7 @@ RUN apk add --no-cache \
   borgbackup \
   ca-certificates \
   fuse3 \
+  py3-pyfuse3 \
   tzdata
 RUN wget -qO - https://github.com/tigrisdata/tigrisfs/releases/download/v1.2.1/tigrisfs_1.2.1_linux_amd64.tar.gz | tar xz -C /usr/local/bin tigrisfs
 
