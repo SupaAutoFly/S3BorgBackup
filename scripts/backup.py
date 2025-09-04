@@ -49,7 +49,9 @@ class TigrisfsMount:
       'AWS_SECRET_ACCESS_KEY': self.secret_access_key,
     }
     subprocess.run(
-      ['/usr/local/bin/tigrisfs', self.mount_source, self.mountpoint, ],
+      ['/usr/local/bin/tigrisfs',
+       '--no-tigris-prefetch',
+       self.mount_source, self.mountpoint ],
       stdout=subprocess.DEVNULL,
       stderr=subprocess.DEVNULL,
       env=tigrisfs_env,
@@ -92,7 +94,10 @@ def run_backup(backup_label, target_name, target_config, target_secrets):
 
     borg_env = os.environ | {'BORG_PASSPHRASE': borg_passphrase}
     compression = target_config.get('compression', 'auto,zstd,22')
-    subprocess.run(['/usr/bin/borg', 'create', '--stats',
+    subprocess.run(['/usr/bin/borg',
+                    'create',
+                    '--stats',
+                    '--files-cache', 'ctime,size',
                     '--compression', compression,
                     f'{borg_repo}::{backup_label}-{{now:%Y-%m-%dT%H:%M:%S}}',
                     '/data/source'], env=borg_env, check=True)
